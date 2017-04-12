@@ -1,1 +1,1 @@
-# Hexagon-alpha-CuCl3
+# Hexagon-alpha-RuCl3
