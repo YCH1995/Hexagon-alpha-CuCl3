@@ -1,0 +1,671 @@
+import numpy as np
+from math import *
+from numpy.linalg import eig
+from scipy.sparse.linalg import eigsh
+from scipy.sparse import *
+from itertools import combinations
+from numba import jit
+import matplotlib.pyplot as plt
+ 
+#The function below calculate (2n)!/(n!)(n!).
+def combination(n,site):                  
+    temp=int(factorial(site*n)/(factorial(n)*factorial((site-1)*n)))
+    return temp                            
+    
+def make_base(n,site,state): 
+    base=np.arange(int(site*n))               
+    index=0
+    if(state==0):
+        elec_num=n
+        length=combination(n,site)
+    elif(state==1):
+        elec_num=n+1
+        length=int(combination(n,site)*n/(n+1))
+    elif(state==-1):
+        elec_num=n-1
+        length=int(combination(n,site)*n/(n+1))
+    else:
+        print("Error")
+    trans=[0]*length
+    for i in combinations(base,elec_num):
+        result=0
+        temp=1<<31
+        for elem in i:
+            if(elem<31):
+                result += 1<<elem     
+            else:
+                etemp=elem-31
+                result += temp*(1<<etemp)
+#        trans[index]=int(result)
+        trans[index]=result
+        index=index+1   
+    trans.sort()
+    return trans
+
+def locat(i,array):  
+#Using dichotomy to find the location of i in list array.If i is not in array,
+#return Error.
+    high = len(array) - 1
+    low = 0
+    if i > array[high] or i < array[0]:
+        raise InputError('The item does not in the collection!')
+    elif i == array[0]:
+        return 0
+    elif i == array[high]:
+        return high
+    else:
+        while (high - low) > 1:
+            mid = int((low + high) / 2)
+            if i == array[mid]:
+                return mid
+            elif i < array[mid]:
+                high = mid
+            elif i > array[mid]:
+                low =mid
+        raise InputError('The item does not in the collection!')
+   
+def num(n,i,j):
+#Return the number of "1"s between the ith and jth items in list n.
+    count=0
+    if(i>=j):
+        raise InputError('i is bigger than j')
+    if((j-i)==1):
+        return 0
+    for pos in range(i+1,j):
+        if(np.bitwise_and(n,1<<pos)==1<<pos):
+            count=count+1            
+    return count
+
+def hopping_matrix(i,j,array,n):
+#i,j Means two different sites.This function returns the hopping term.
+    a=[]
+    for k in range(n):
+        a.append(int(array[k]))
+    if(i==j):
+        buff=np.bitwise_and(a,1<<i)==1<<i
+        column=np.where(buff==True)[0]
+        lenl=len(column)
+        eff=[1]*lenl
+        mtx = csr_matrix((eff,(column ,column)),shape=(n,n))
+    else:
+        buff0=np.bitwise_and(a,1<<i)==0
+        buff1=np.bitwise_and(a,1<<j)==1<<j
+        buff=np.logical_and(buff0,buff1)  
+        column=np.where(buff==True)[0]
+        len1=len(column)
+        init=[0]*len1
+        final=[0]*len1
+        diff=(1<<i)-(1<<j)
+        for count in range(len1):
+            init[count]=a[column[count]]
+            final[count]=init[count]+diff
+        count=0
+        row=[0]*len1
+        eff=[0]*len1
+        for sta in final:
+            row[count]=locat(sta,a)
+            eff[count]=(-1)**(num(sta,i,j))
+            count=count+1
+        mtx = csr_matrix((eff, (row, column)), shape=(n,n))
+        mtx=mtx+csr_matrix((eff, (column, row)), shape=(n,n))
+    return mtx
+ 
+def crystal_field_matrix(a,d,total_s,t3):
+    mtx=0
+    for site in range(total_s):
+        for spin in range(2):
+            for m1 in range(2):
+                for m2 in range(m1+1,3):
+                    i=6*site+spin+m1*2
+                    j=6*site+spin+m2*2
+                    mtx=mtx+hopping_matrix(i,j,a,d)*t3
+    return mtx
+   
+def kinetic_matrix(a,d,total_s,T):
+    mtx=0
+    for spin in range(2):
+        for site1 in range(total_s):
+            for site2 in range(site1+1,total_s):
+                diff=site2-site1
+                distance=min(diff,total_s-diff)
+                H=T[distance]
+                for m1 in range(3):
+                    for m2 in range(3):
+                        p_amplitude=H[m1][m2]
+                        if(p_amplitude==0):
+                            mtx=mtx+0
+                        else:
+                            i=6*site1+spin+2*m1
+                            j=6*site2+spin+2*m2
+                            mtx=mtx+hopping_matrix(i,j,a,d)*p_amplitude
+    return mtx
+
+def soc_matrix(a,d,total_s,Hsoc):
+    mtx=0
+    for site in range(total_s):
+        for i in range(6):
+            ket=[0]*6
+            ket[i]=1
+            new=Hsoc.dot(ket)
+            for j in range(6):
+                if(abs(new[j])>1E-4):
+                    Amp=new[j]
+                    temp1=site*6+min(i,j)
+                    temp2=site*6+max(i,j)
+                    mtx=mtx+Amp*hopping_matrix(temp1,temp2,a,d)
+    return mtx
+  
+def H_first(A,a,d,total_s,site):
+    mtx=0
+    for j in range(3):
+        i=2*j+total_s*site
+        k=2*j+1+total_s*site
+        buff0=np.bitwise_and(a,1<<i)==1<<i
+        buff1=np.bitwise_and(a,1<<k)==1<<k
+        buff=np.logical_and(buff0,buff1)
+        column=np.where(buff==True)[0]
+        len1=len(column)
+        eff=[A]*len1
+        mtx=mtx+csr_matrix((eff,(column,column)),shape=(d,d))
+    return mtx 
+
+def H_second(A,a,d,total_s,site):
+    mtx=0
+    for m1 in range(2):
+        for m2 in range(m1+1,3):
+            for spin1 in range(2):
+                for spin2 in range(2):
+                    i=total_s*site+m1*2+spin1
+                    j=total_s*site+m2*2+spin2
+                    buff0=np.bitwise_and(a,1<<i)==1<<i
+                    buff1=np.bitwise_and(a,1<<j)==1<<j
+                    buff=np.logical_and(buff0,buff1)
+                    column=np.where(buff==True)[0]
+                    len1=len(column)
+                    eff=[A/2]*len1
+                    mtx=mtx+csr_matrix((eff,(column,column)),shape=(d,d))
+    return mtx
+    
+def H_third(A,a,d,total_s,site):
+    ##further
+    mtx=0
+    for m1 in range(2):
+        for m2 in range(m1+1,3):
+            for spin1 in range(2):
+                for spin2 in range(2):
+                    i=site*total_s+m1*2+spin1
+                    j=site*total_s+m2*2+spin2
+                    k=site*total_s+m1*2+spin2
+                    l=site*total_s+m2*2+spin1
+                    buff0=np.bitwise_and(a,1<<i)==0
+                    buff1=np.bitwise_and(a,1<<j)==0
+                    buff2=np.bitwise_and(a,1<<k)==1<<k
+                    buff3=np.bitwise_and(a,1<<l)==1<<l
+                    buff=np.logical_and(buff0,buff1)
+                    buff=np.logical_and(buff,buff2)
+                    buff=np.logical_and(buff,buff3)
+                    column=np.where(buff==True)[0]
+                    len1=len(column)
+                    init=[0]*len1
+                    final=[0]*len1
+                    diff=(1<<i)+(1<<j)-(1<<k)-(1<<l)
+                    for count in range(len1):
+                        init[count]=a[column[count]]
+                        final[count]=init[count]+diff
+                    count=0
+                    row=[0]*len1
+                    eff=[0]*len1
+                    for sta in final:
+                        exp=num(sta,i,j)+num(sta,k,l)#####
+                        row[count]=locat(sta,a)
+                        eff[count]=(-1)**exp
+                        count=count+1
+                mtx = mtx + csr_matrix((eff, (row, column)), shape=(d,d))
+                mtx = mtx + csr_matrix((eff, (column, row)), shape=(d,d))
+    return mtx
+
+def H_forth(A,a,d,total_s,site):
+    mtx=0
+    for m1 in range(2):
+        for m2 in range(m1+1,3):
+            for spin1 in range(2):
+                spin2=1-spin1
+                i=total_s*site+m1*2+spin1
+                j=total_s*site+m1*2+spin2
+                k=total_s*site+m2*2+spin2
+                buff0=np.bitwise_and(a,1<<i)==1<<i
+                buff1=np.bitwise_and(a,1<<j)==0
+                buff2=np.bitwise_and(a,1<<k)==1<<k
+                buff=np.logical_and(buff1,buff2)
+                buff=np.logical_and(buff,buff0)
+                column=np.where(buff==True)[0]
+                lenl=len(column)
+                init=[0]*lenl
+                final=[0]*lenl
+                diff=(1<<j)-(1<<k)
+                for count in range(lenl):
+                    init[count]=a[column[count]]
+                    final[count]=init[count]+diff
+                count=0
+                row=[0]*lenl
+                column=[0]*lenl
+                eff=[0]*lenl
+                for sta in final:
+                    row[count]=locat(sta,a)
+                    eff[count]=(-1)**(num(sta,j,k))
+                    count=count+1
+                mtx = mtx + csr_matrix((eff,(row,column)),shape=(d,d))
+                mtx = mtx + csr_matrix((eff,(column,row)),shape=(d,d))
+    return mtx
+          
+def interaction_matrix(a,d,total_s,U,J):
+    mtx=0
+    for site in range(total_s):
+        H1=H_first(U,a,d,total_s,site)
+        H2=H_second(U+2*J,a,d,total_s,site)
+        H3=H_third(J,a,d,total_s,site)
+        H4=H_forth(J,a,d,total_s,site)
+        mtx=mtx+H1+H2+H3+H4
+    return mtx
+ 
+#Containing only the nearest.
+def intercluster(T,direction,k):
+    site=6
+    Q=direction
+    Q[0]=k*direction[0]
+    Q[1]=k*direction[1]
+    P=np.ones((6,6))
+    R=np.array(-1.5,1.5*sqrt(3))
+    phase=np.vdot(Q,R)
+    P[0][3]=complex(cos(phase),sin(phase))
+    P[3][0]=complex(cos(phase),(-1)*sin(phase))
+    R=np.array(1.5,1.5*sqrt(3))
+    phase=np.vdot(Q,R)
+    P[1][4]=complex(cos(phase),sin(phase))
+    P[4][1]=complex(cos(phase),(-1)*sin(phase))
+    R=np.array(3,0)
+    phase=np.vdot(Q,R)
+    P[2][5]=complex(cos(phase),sin(phase))
+    P[5][2]=complex(cos(phase),(-1)*sin(phase))
+    
+    V=np.zeros((36,36),dtype=complex)
+    for i in range(36):
+        for j in range(i+1,36):
+            i2=int(i/6)
+            j2=int(j/6)
+            diff=3-abs(i2-i3)
+            if(diff==3):
+                V[i][j]=0
+            else:
+                M=T[diff]
+                i3=int((i%6)/2)
+                j3=int((j%6)/2)
+                V[i][j]=M[i3][j3]*P[i2][j2]
+            V[j][i]=M[i3][j3]*P[j2][i2]
+    
+    return V
+    
+def Lanczos(array,mtx,iter_time):
+    a=[]
+    b=[]
+    c1=sqrt(np.vdot(array,array))
+    v1=array/c1
+    w1=mtx.dot(v1)
+    c0=np.vdot(w1,v1)
+    a.append(c0)
+    w2=w1-c0*v1
+    for i in range(iter_time-1):
+        c1=sqrt(np.vdot(w2,w2))
+        if(c1<1e-6):
+            break
+        b.append(c1)
+        v0=v1
+        v1=w2/c1
+        w1=mtx.dot(v1)
+        c0=np.vdot(w1,v1)
+        a.append(c0)
+        w2=w1-c0*v1-c1*v0
+    return(a,b)
+
+def Lanczos_store(array,mtx,iter_time):
+    a=[]
+    b=[]
+    ket_store=[]
+    c1=sqrt(np.vdot(array,array))
+    v1=array/c1
+    ket_store.append(v1)
+    w1=mtx.dot(v1)
+    c0=np.vdot(w1,v1)
+    a.append(c0)
+    w2=w1-c0*v1
+    for i in range(iter_time-1):
+        c1=sqrt(np.vdot(w2,w2))
+        if(c1<1e-6):
+            break
+        v0=v1
+        v1=w2/c1
+        ket_store.append(v1)
+        w1=mtx.dot(v1)
+        c0=np.vdot(w1,v1)
+        b.append(c1)
+        a.append(c0)
+        w2=w1-c0*v1-c1*v0
+    if(c1>1e-6):
+        i=i+1
+    H_tri=np.diag(a,0)+np.diag(b,1)+np.diag(b,-1)
+    return(ket_store,H_tri,i+1)
+    
+def Lanczos_mtx(array,mtx,iter_time):
+    a,b=Lanczos(array,mtx,iter_time)
+    H_tri=np.diag(a,0)+np.diag(b,1)+np.diag(b,-1)
+    return H_tri
+ 
+def Lanczos_time(array,mtx,precision):
+    i=9
+    H=Lanczos_mtx(array,mtx,i)
+    a,b=eigsh(H,2,which='SA',tol=1E-4)
+    t0=a[0]
+    for i in range(10,200):
+        H=Lanczos_mtx(array,mtx,i)
+        a,b=eigsh(H,2,which='SA',tol=1E-4)
+        if(abs(t0-a[0])<precision):
+            break
+        t0=a[0]
+    return i
+    
+def Lanczos_ground_state(array,mtx,iter_time):
+    ket_store,H_tri,i=Lanczos_store(array,mtx,iter_time)
+    a,b=eigsh(H_tri,2,which='SA',tol=1E-4)
+    ground_ket=0
+    for count in range(i):
+        ground_ket=ground_ket+b[count][0]*ket_store[count]        
+    return (a[0],ground_ket)
+    
+def H_tra(n,site,state,l):
+#a1 is the origin one,a2 is added or subtracted one electron from a1.
+#This function is used to transfer two bases.
+#Which can also consider as the matrix representation of annhilation OP or
+#produce OP.Necessary when calculating the green function with Lanczos.
+    a1=make_base(n,site,0)
+    a2=make_base(n,site,state)
+    if(state==1):
+        buff=np.bitwise_and(a1,1<<l)==0
+        diff=1<<l
+    elif(state==-1):
+        buff=np.bitwise_and(a1,1<<l)==1<<l
+        diff=0-(1<<l)
+    column=np.where(buff==True)[0]
+    lenl=len(column)
+    init=[0]*lenl
+    final=[0]*lenl
+    for count in range(lenl):
+        init[count]=a1[column[count]]
+        final[count]=init[count]+diff
+    count=0
+    row=[0]*lenl
+    eff=[0]*lenl
+    for sta in final:
+        row[count]=locat(sta,a2)
+        eff[count]=(-1)**(num(sta,l,2*n))
+        count=count+1
+    dim=combination(n,site)
+    dim2=int(d*(site*n-n)/(n+1))
+    mtx = csr_matrix((eff, (row, column)), shape=(dim2,dim))
+    return mtx        
+    
+def normal(array):                           #归一化
+    mold=sqrt(np.vdot(array,array))
+    return array/mold
+    
+def set_of_ket(n,state,ket):
+    s=[]
+    for i in range(6):
+        for orbit in range(3):
+            for spin in range(2):
+                H=H_tra(n,6,state,n*i+2*orbit+spin)
+                f=H.dot(ket)
+                s.append(f)
+#        f=normal(f)
+    return s
+
+def Set_of_Lanczos(s,H,site,iter_time):
+#OMG
+    set_of_complete_set=[]
+    set_of_Htri=[]
+    for i in range(site):
+        f=s[i]
+        store,Htri,time=Lanczos_store(f,H,iter_time)
+        set_of_complete_set.append(store)
+        set_of_Htri.append(Htri)
+    return (set_of_complete_set,set_of_Htri)        
+ 
+def Green_mtx_standard(z,n,site,s1,s2,H1,H2,ground_energy,ground_ket):
+    d=combination(n,site)
+    d2=int(d*(site*n-n)/(n+1))
+    d3=int(d*n/(site*n-n+1))
+    G=np.zeros((site,site),dtype=complex)
+    for i in range(site):
+        for j in range(site):
+            f1=s1[i]#ca+
+            f2=s1[j]#cb+
+#            f1=normal(f1)
+#            f2=normal(f2)
+            temp=[z+ground_energy]*d2
+            H0=np.diag(temp,0)-H1#z+E-H
+            Hi=np.linalg.inv(H0)#1/(z+E-H) 
+            g=np.vdot(f1,Hi.dot(f2))
+            
+            f1=s2[j]#cb-
+            f2=s2[i]#ca-
+#            f1=normal(f1)
+#            f2=normal(f2)
+            temp=[z-ground_energy]*d3
+            H0=np.diag(temp,0)+H2#z-E+H
+            Hi=np.linalg.inv(H0)#1/(z-E+H)
+            g=g+np.vdot(f1,Hi.dot(f2))
+            G[i][j]=g
+    return G
+  
+def Green_mtx_Lanczos(z,n,site,H2,H3,ground_energy,ground_ket,orbit):
+    G=np.zeros((site,site),dtype=complex)
+    a2=make_base(n,site,1)
+    a3=make_base(n,site,-1)
+    for i in range(site):
+        for j in range(site):
+            left=[]
+            f1=H_tra(n,site,1,n*i+2*orbit).dot(ground_ket)
+            f2=H_tra(n,site,1,n*j+2*orbit).dot(ground_ket)
+#            f1=normal(f1)
+#            f2=normal(f2)
+            s,H,time=Lanczos_store(f2,H2,250)
+            for k in range(time):
+                left.append(np.vdot(f1,s[k]))
+            temp=[z+ground_energy]*time
+            H0=np.diag(temp,0)-H
+            e=[0]*(time)
+            e[0]=1
+            x=np.linalg.inv(H0).dot(e)
+            g=np.vdot(left,x)
+            
+            left=[]
+            f1=H_tra(n,site,-1,n*i+2*orbit).dot(ground_ket)
+            f2=H_tra(n,site,-1,n*j+2*orbit).dot(ground_ket)
+#            f1=normal(f1)
+#            f2=normal(f2)
+            s,H,time=Lanczos_store(f2,H3,250)
+            for k in range(time):
+                left.append(np.vdot(f1,s[k]))
+            temp=[z-ground_energy]*time
+            H0=np.diag(temp,0)+H
+            e=[0]*time
+            e[0]=1
+            x=np.linalg.inv(H0).dot(e)
+            g=g+np.vdot(left,x)
+            G[i][j]=g
+    return G
+
+def Green_mtx_Lanczos_new(z,site,s1,s2,c1,c2,
+                          Tri1,Tri2,ground_energy,ground_ket):
+    G=np.zeros((36,36),dtype=complex)
+    for i in range(36):
+        for j in range(36):
+            f1=s1[i]
+            f2=s1[j]
+            store=c1[j]
+            H=Tri1[j]
+            left=[]
+            t=H.shape[0]
+            for k in range(t):
+                left.append(np.vdot(f1,store[k]))
+            temp=[z+ground_energy]*t
+            H0=np.diag(temp,0)-H
+            e=[0]*(t)
+            e[0]=1
+            x=np.linalg.inv(H0).dot(e)
+            g=np.vdot(left,x)
+            
+            f1=s2[j]
+            f2=s2[i]
+            store=c2[i]
+            H=Tri2[i]
+            left=[]
+            t=H.shape[0]
+            for k in range(t):
+                left.append(np.vdot(f1,store[k]))
+            temp=[z-ground_energy]*t
+            H0=np.diag(temp,0)+H
+            e=[0]*t
+            e[0]=1
+            x=np.linalg.inv(H0).dot(e)
+            g=g+np.vdot(left,x)
+            G[i][j]=g
+    return G
+   
+def inside_cluster_vector():
+    R=[]
+    vec=np.zeros(2)
+    vec=(-0.5,0.5*sqrt(3))
+    R.append(vec)
+    vec=(0.5,0.5*sqrt(3))
+    R.append(vec)
+    vec=(1,0)
+    R.append(vec)
+    vec=(0.5,-0.5*sqrt(3))
+    R.append(vec)
+    vec=(-0.5,-0.5*sqrt(3))
+    R.append(vec)
+    vec=(-1,0)
+    R.append(vec)
+    return R   
+    
+def Periodization(G,site,T,direction,k):
+#This part is actually the most important part in cluster perturbation theory.
+#V describes the interaction between different clusters.
+    V=intercluster(T,direction,k)
+    R=inside_cluster_vector()
+    kvec=direction
+    kvec[0]=k*direction[0]
+    kvec[1]=k*direction[1]
+    GreenRPA=np.linalg.inv(G)-V
+    GreenRPA=np.linalg.inv(GreenRPA)
+    GreenCPT=0
+    for a in range(36):
+        for b in range(36): 
+            rvec=R[a/6]-R[b/6]
+            phase=np.vdot(rvec,kvec)
+            GreenCPT=GreenCPT+complex(cos(phase),sin(phase))*GreenRPA[a][b]
+    GreenCPT=GreenCPT/36
+    return GreenCPT.imag*(-2)
+    
+#Basic Data from first principle                          
+T=[]
+T1=np.array([[58.7,113.9,-7.0],
+     [113.9,58.7,-7.0],
+     [-7,-7,-194.1]])
+T.append(T1)
+T2=np.array([[-0.7,-27.6,3.6],[-51.9,-0.7,6.2],[6.2,3.6,1.6]])
+T.append(T2)
+T3=np.array([[-6.3,-4.8,10.7],[-4.8,-6.3,10.7],[10.7,10.7,-43.9]])
+T.append(T3)
+t3=-8.6
+h=np.array([[0,t3,t3],[t3,0,t3],[t3,t3,0]])
+H_soc=np.zeros((6,6),dtype=complex)
+i=complex(0,1)
+H_soc=np.array([[0,i,0,0,0,-1],
+                [i*(-1),0,0,0,0,i],
+                [0,0,0,1,i*(-1),0],
+                [0,0,1,0,i*(-1),0],
+                [0,0,i,i,0,0],
+                [-1,i*(-1),0,0,0,0]])
+U=0.8
+J=2.3
+#Start constructing Matrix
+n=6  #Freendom on one site
+site=6
+a=make_base(n,site,0)        
+d=combination(n,site)
+H1=kinetic_matrix(a,d,site,T)+crystal_field_matrix(a,d,site,t3)\
+    +soc_matrix(a,d,site,H_soc)+interaction_matrix(a,d,site,U,J)#.toarray()
+#    +soc_matrix(a,d,site,H_soc)
+a2=make_base(n,site,1)
+d2=int(d*(site*n-n)/(n+1))
+a3=make_base(n,site,-1)
+d3=int(d*n/(site*n-n+1))
+H2=kinetic_matrix(a2,d2,site,T)+crystal_field_matrix(a2,d2,site,t3)\
+    +soc_matrix(a2,d2,site,H_soc)+interaction_matrix(a2,d2,site,U,J)#.toarray()
+H3=kinetic_matrix(a3,d3,site,T)+crystal_field_matrix(a3,d3,site,t3)\
+    +soc_matrix(a3,d3,site,H_soc)+interaction_matrix(a3,d3,site,U,J)#.toarray()
+temp=np.random.random(d)#Random array
+i=Lanczos_time(temp,H1,1E-8)#Use Lanczos Iteration.(Stop when converged)
+a,b=Lanczos_ground_state(temp,H1,i)#A returns ground energy,b returns ket.
+s1=set_of_ket(n,1,b)
+s2=set_of_ket(n,-1,b)
+c1=[]
+c2=[]
+Tri1=[]
+Tri2=[]
+for i in range(36):
+    complete1,Htri1=Set_of_Lanczos(s1[i],H2,site,200)
+    c1.append(complete1)
+    Tri1.append(Htri1)
+    complete2,Htri2=Set_of_Lanczos(s2[i],H3,site,200)
+    C2.append(complete1)
+    Tri2.append(Htri2)
+H2=H2.toarray()
+H3=H3.toarray()
+#G=Green_mtx_standard(-1.2,n,site,s1[0],s2[0],H2,H3,a,b)
+#G2=Green_mtx_Lanczos(-1.2,n,site,H2,H3,a,b,0)
+#G=Green_mtx_Lanczos_new(-1.2,site,s10,s20,complete1,complete2,
+#                          Htri1,Htri2,a,b)
+#print(G)
+direction=[]
+d=(1,0)
+direction.append(d)
+d=(0,1)
+direction.append(d)
+d=(0.5,0.5*sqrt(3))
+direction.append(d)
+pointnum=50#Size of picture is pnum*pnum
+x=np.linspace(-4,4,pointnum)#Range for x
+s=np.zeros([pointnum,pointnum])
+k0=3.141592653589793
+k=np.linspace(0,k0,pointnum)#Range for k
+for count in range(pointnum):
+    for count2 in range(pointnum):
+        print(count,count2)
+        z=x[count]+0.03j#0.03j just represents a small imaginary part.
+#        G=Green_mtx_standard(z,n,s1,s2,H2,H3,a,b)
+#Lehmmann Rep for Green function
+#        G=Green_mtx_Lanczos(z,n,U,a,b)      
+        G=Green_mtx_Lanczos_new(z,site,s1,s2,c1,c2,Tri1,Tri2,a,b)  
+        s[count][count2]=Periodization(G,site,T,direction[0],k[count2])
+        #Periodization
+       
+plt.figure()
+plt.contourf(k,x,s,200)
+plt.colorbar()
+plt.show()
+
+
+      
+
